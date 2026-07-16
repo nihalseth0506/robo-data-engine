@@ -1,0 +1,13 @@
+build/
+install/
+log/
+datasets/
+mujoco_menagerie/
+__pycache__/
+*.pyc
+*.pyo
+scratch_test.py
+check_camera.py
+view_camera.py
+MUJOCO_LOG.TXT
+*.txt
