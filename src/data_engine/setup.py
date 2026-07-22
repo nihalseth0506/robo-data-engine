@@ -24,6 +24,9 @@ setup(
             'ur5e_node = data_engine.ur5e_node:main',
             'sync_node = data_engine.sync_node:main',
             'teleop_node = data_engine.teleop_node:main',
+            'skydio_node = data_engine.skydio_node:main',
+            'skydio_teleop_node = data_engine.skydio_teleop_node:main',
+            'skydio_sync_node = data_engine.skydio_sync_node:main',
         ],
     },
 )
