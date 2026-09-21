@@ -1,6 +1,6 @@
 # robo-data-engine
 
-A universal robot data collection and synchronization pipeline built on ROS2 Jazzy and MuJoCo 3.10.
+A robot data collection and synchronization pipeline built on ROS2 Jazzy and MuJoCo 3.10.
 
 ## What this is
 
@@ -23,8 +23,9 @@ sync_node            ←  all three topics
 
 ros2 bag record      →  datasets/raw/episode_NNN/  (MCAP format)
 
-export/to_lerobot.py →  datasets/processed/episode_NNN.parquet
-                     →  datasets/processed/episode_NNN.mp4
+export/to_lerobot.py →  datasets/processed/data/chunk-000/episode_NNNNNN.parquet
+                     →  datasets/processed/videos/chunk-000/observation.images.wrist/episode_NNNNNN.mp4
+                     →  datasets/processed/meta/{info,episodes,tasks}.json
 ```
 
 ## Key engineering decisions
@@ -35,7 +36,7 @@ export/to_lerobot.py →  datasets/processed/episode_NNN.parquet
 
 **Embodiment-agnostic schema** — `joint_positions` is stored as `pa.list_(pa.float64())` (variable length) so the same parquet schema accommodates the UR5e's 6 joints and the Skydio X2's 7-DOF free-body state (xyz + quaternion) without any schema changes. The `embodiment` column carries the per-row context a downstream model needs to interpret the state vector correctly.
 
-**lerobot-compatible export** — output format matches the Hugging Face lerobot dataset standard: one parquet file per episode with `(timestamp_ns, embodiment, joint_positions, joint_velocities, joint_commands, state_gap_ms, cmd_gap_ms)` columns, one MP4 per episode for human visual inspection.
+**Genuine lerobot v2.1 output** — export produces a fully `LeRobotDataset`-loadable dataset: correct folder structure (`data/chunk-NNN/`, `videos/chunk-NNN/observation.images.wrist/`, `meta/`), correct column names (`observation.state`, `action`, `timestamp` as float32 seconds from episode start, `frame_index`, `episode_index`, `index`, `task_index`), and all three required meta files (`info.json`, `episodes.json`, `tasks.json`). Embodiment is auto-detected from bag topic names — no flags required.
 
 ## Stack
 
@@ -124,32 +125,36 @@ source /opt/ros/jazzy/setup.bash
 python3 export/to_lerobot.py \
     datasets/raw/episode_001 \
     --output-dir datasets/processed \
-    --episode-id 1
+    --episode-id 1 \
+    --task "reach toward red cube"
 ```
 
 Output per episode:
-- `datasets/processed/episode_001.parquet` — time-aligned (state, action) table
-- `datasets/processed/episode_001.mp4` — wrist camera video for visual inspection
+- `datasets/processed/data/chunk-000/episode_000001.parquet` — lerobot v2.1 parquet
+- `datasets/processed/videos/chunk-000/observation.images.wrist/episode_000001.mp4` — camera video
+- `datasets/processed/meta/info.json` — dataset structure and feature schema
+- `datasets/processed/meta/episodes.json` — per-episode metadata
+- `datasets/processed/meta/tasks.json` — task descriptions
 
 ## Dataset schema
 
 | Column | Type | Description |
 |---|---|---|
-| `timestamp_ns` | int64 | ROS2 system clock at image capture |
-| `episode_id` | int32 | Episode number |
-| `embodiment` | string | Robot type (`ur5e`, `skydio_x2`, …) |
-| `joint_positions` | list[float64] | Joint angles at capture time |
-| `joint_velocities` | list[float64] | Joint velocities at capture time |
-| `joint_commands` | list[float64] | Teleop target angles at capture time |
+| `observation.state` | list[float64] | Joint angles (UR5e ×6) or xyz+quaternion (Skydio ×7) |
+| `action` | list[float64] | Teleop commands at capture time |
+| `timestamp` | float32 | Seconds from episode start |
+| `frame_index` | int64 | Frame number within episode |
+| `episode_index` | int64 | Episode number |
+| `index` | int64 | Global frame index across all episodes |
+| `task_index` | int64 | Task identifier (0 for single-task datasets) |
+| `embodiment` | string | Robot type — `ur5e` or `skydio_x2` |
 | `state_gap_ms` | float64 | Time gap between image and matched state |
 | `cmd_gap_ms` | float64 | Time gap between image and matched command |
 
 ## Roadmap
 
-- [x] Phase 1: UR5e arm — simulation, teleoperation, 3-way sync, MCAP recording, lerobot export
-- [ ] Phase 2: Skydio X2 drone — second embodiment, prove pipeline is genuinely embodiment-agnostic
-- [ ] Phase 3: Cross-embodiment behavior cloning baseline (shared policy across both embodiments)
-- [ ] Phase 4: Docker containerization + GitHub Actions CI
+- [x] Phase 1: UR5e arm — simulation, wrist camera, keyboard teleop, 3-way sync, MCAP recording, lerobot v2.1 export
+- [x] Phase 2: Skydio X2 drone — free-body sim, PID hover controller, velocity teleop, same pipeline proves embodiment-agnostic design
 
 ## Author
 
