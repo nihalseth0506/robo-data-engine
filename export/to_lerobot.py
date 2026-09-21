@@ -1,4 +1,5 @@
 import os
+import json
 import argparse
 import numpy as np
 import pandas as pd
@@ -11,18 +12,17 @@ from sensor_msgs.msg import JointState, Image
 from geometry_msgs.msg import PoseStamped
 from cv_bridge import CvBridge
 
-
 bridge = CvBridge()
+CHUNKS_SIZE = 1000
+CODEBASE_VERSION = "v2.1"
 
 
 def read_bag(bag_path):
-    """Read all messages from MCAP — auto-detects embodiment from topics present."""
     storage_options = StorageOptions(uri=bag_path, storage_id="mcap")
     converter_options = ConverterOptions(
         input_serialization_format="cdr",
         output_serialization_format="cdr",
     )
-
     reader = SequentialReader()
     reader.open(storage_options, converter_options)
 
@@ -35,7 +35,6 @@ def read_bag(bag_path):
     for name, t in topic_types.items():
         print(f"  {name}  [{t}]")
 
-    # auto-detect embodiment from which state topic exists
     if "/ur5e/joint_states" in topic_types:
         embodiment = "ur5e"
         state_topic = "/ur5e/joint_states"
@@ -51,105 +50,90 @@ def read_bag(bag_path):
 
     print(f"\nDetected embodiment: {embodiment}")
 
-    states   = []
-    images   = []
-    commands = []
+    states, images, commands = [], [], []
 
     while reader.has_next():
         topic, data, timestamp_ns = reader.read_next()
-
         if topic == state_topic:
-            if embodiment == "ur5e":
-                msg = deserialize_message(data, JointState)
-                states.append((timestamp_ns, msg))
-            else:
-                msg = deserialize_message(data, PoseStamped)
-                states.append((timestamp_ns, msg))
-
+            msg = deserialize_message(
+                data, JointState if embodiment == "ur5e" else PoseStamped
+            )
+            states.append((timestamp_ns, msg))
         elif topic == image_topic:
             msg = deserialize_message(data, Image)
             images.append((timestamp_ns, msg))
-
         elif topic == cmd_topic:
             msg = deserialize_message(data, JointState)
             commands.append((timestamp_ns, msg))
 
-    print(f"Read: {len(states)} states, "
-          f"{len(images)} images, "
+    print(f"Read: {len(states)} states, {len(images)} images, "
           f"{len(commands)} commands")
-
     return states, images, commands, embodiment
 
 
 def find_closest(timestamp_ns, stream, slop_ns=50_000_000):
-    """Find message closest in time to timestamp_ns, within slop_ns tolerance."""
-    best_msg = None
-    best_gap = float("inf")
-
+    best_msg, best_gap = None, float("inf")
     for ts, msg in stream:
         gap = abs(ts - timestamp_ns)
         if gap < best_gap:
             best_gap = gap
             best_msg = msg
-
     if best_msg is None or best_gap > slop_ns:
         return None, best_gap
-
     return best_msg, best_gap
 
 
 def extract_state(msg, embodiment):
-    """Extract state vector from message, normalized per embodiment."""
     if embodiment == "ur5e":
-        # JointState: first 6 values are arm joints, rest is cube free joint
         return list(msg.position)[:6], list(msg.velocity)[:6]
-
     else:
-        # PoseStamped: [x, y, z, qw, qx, qy, qz]
         p = msg.pose.position
         q = msg.pose.orientation
-        positions  = [p.x, p.y, p.z, q.w, q.x, q.y, q.z]
-        velocities = [0.0] * 7   # pose msg has no velocity field
-        return positions, velocities
+        return [p.x, p.y, p.z, q.w, q.x, q.y, q.z], [0.0] * 7
 
 
-def extract_command(msg, embodiment):
-    """Extract action vector from JointState command message."""
-    # both embodiments use JointState for stamped commands:
-    # ur5e:    position = [joint targets × 6]
-    # skydio:  position = [vx, vy, vz]
+def extract_command(msg):
     return list(msg.position)
 
 
-def export_episode(bag_path, output_dir, episode_id):
-    """Convert one MCAP bag into parquet + video."""
+def export_episode(bag_path, output_dir, episode_id, task="reach and manipulate"):
     os.makedirs(output_dir, exist_ok=True)
 
     states, images, commands, embodiment = read_bag(bag_path)
-
     if not images:
-        print("No images found — nothing to export.")
+        print("No images found.")
         return
 
-    # build video from first image dimensions
+    # determine chunk and paths
+    chunk = episode_id // CHUNKS_SIZE
+    chunk_str = f"chunk-{chunk:03d}"
+    ep_str    = f"episode_{episode_id:06d}"
+
+    data_dir  = os.path.join(output_dir, "data",   chunk_str)
+    video_dir = os.path.join(output_dir, "videos", chunk_str,
+                             "observation.images.wrist")
+    meta_dir  = os.path.join(output_dir, "meta")
+    for d in [data_dir, video_dir, meta_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    # video writer
     first_rgb = bridge.imgmsg_to_cv2(images[0][1], desired_encoding="rgb8")
     h, w = first_rgb.shape[:2]
-    video_path = os.path.join(output_dir, f"episode_{episode_id:03d}.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-
+    video_path = os.path.join(video_dir, f"{ep_str}.mp4")
     duration_s = (images[-1][0] - images[0][0]) / 1e9
-    fps = len(images) / duration_s if duration_s > 0 else 10.0
-    fps = float(np.clip(fps, 1.0, 30.0))
+    fps = float(np.clip(len(images) / duration_s if duration_s > 0 else 10.0,
+                        1.0, 30.0))
+    writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (w, h))
 
-    writer = cv2.VideoWriter(video_path, fourcc, fps, (w, h))
-
-    print(f"\nVideo: {w}x{h} @ {fps:.1f} fps")
+    print(f"\nVideo: {w}x{h} @ {fps:.1f} fps → {video_path}")
     print(f"Matching {len(images)} images...")
 
     rows    = []
     skipped = 0
+    t0_ns   = images[0][0]   # episode start time in nanoseconds
 
-    for img_ts_ns, img_msg in images:
+    for frame_idx, (img_ts_ns, img_msg) in enumerate(images):
         state_msg, state_gap = find_closest(img_ts_ns, states)
         cmd_msg,   cmd_gap   = find_closest(img_ts_ns, commands)
 
@@ -157,22 +141,23 @@ def export_episode(bag_path, output_dir, episode_id):
             skipped += 1
             continue
 
-        # extract embodiment-specific vectors
-        joint_positions, joint_velocities = extract_state(state_msg, embodiment)
-        joint_commands = extract_command(cmd_msg, embodiment)
+        obs_state, _ = extract_state(state_msg, embodiment)
+        action        = extract_command(cmd_msg)
 
-        # write image frame to video
         rgb = bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        writer.write(bgr)
+        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
         rows.append({
-            "timestamp_ns":      img_ts_ns,
-            "episode_id":        episode_id,
+            # lerobot v2.1 required columns
+            "observation.state": obs_state,
+            "action":            action,
+            "timestamp":         float((img_ts_ns - t0_ns) / 1e9),
+            "frame_index":       frame_idx,
+            "episode_index":     episode_id,
+            "index":             frame_idx,   # global index — caller can offset
+            "task_index":        0,
+            # extra columns we keep for our own use
             "embodiment":        embodiment,
-            "joint_positions":   joint_positions,
-            "joint_velocities":  joint_velocities,
-            "joint_commands":    joint_commands,
             "state_gap_ms":      state_gap / 1e6,
             "cmd_gap_ms":        cmd_gap   / 1e6,
         })
@@ -180,48 +165,114 @@ def export_episode(bag_path, output_dir, episode_id):
     writer.release()
     print(f"Matched {len(rows)} frames, skipped {skipped}")
 
-    # write parquet with fixed schema
+    if not rows:
+        print("Nothing to write.")
+        return
+
+    # parquet with lerobot v2.1 schema
     schema = pa.schema([
-        pa.field("timestamp_ns",     pa.int64()),
-        pa.field("episode_id",       pa.int32()),
-        pa.field("embodiment",       pa.string()),
-        pa.field("joint_positions",  pa.list_(pa.float64())),
-        pa.field("joint_velocities", pa.list_(pa.float64())),
-        pa.field("joint_commands",   pa.list_(pa.float64())),
-        pa.field("state_gap_ms",     pa.float64()),
-        pa.field("cmd_gap_ms",       pa.float64()),
+        pa.field("observation.state", pa.list_(pa.float64())),
+        pa.field("action",            pa.list_(pa.float64())),
+        pa.field("timestamp",         pa.float32()),
+        pa.field("frame_index",       pa.int64()),
+        pa.field("episode_index",     pa.int64()),
+        pa.field("index",             pa.int64()),
+        pa.field("task_index",        pa.int64()),
+        pa.field("embodiment",        pa.string()),
+        pa.field("state_gap_ms",      pa.float64()),
+        pa.field("cmd_gap_ms",        pa.float64()),
     ])
 
     df    = pd.DataFrame(rows)
     table = pa.Table.from_pandas(df, schema=schema)
-    parquet_path = os.path.join(output_dir, f"episode_{episode_id:03d}.parquet")
+    parquet_path = os.path.join(data_dir, f"{ep_str}.parquet")
     pq.write_table(table, parquet_path)
 
-    print(f"\nExported:")
-    print(f"  Embodiment: {embodiment}")
-    print(f"  Video:      {video_path}")
-    print(f"  Parquet:    {parquet_path}")
-    print(f"  Rows:       {len(rows)}")
+    # meta/info.json
+    state_dim  = len(rows[0]["observation.state"])
+    action_dim = len(rows[0]["action"])
+    info = {
+        "codebase_version": CODEBASE_VERSION,
+        "robot_type":       embodiment,
+        "total_episodes":   1,
+        "total_frames":     len(rows),
+        "total_tasks":      1,
+        "total_videos":     1,
+        "total_chunks":     1,
+        "chunks_size":      CHUNKS_SIZE,
+        "fps":              round(fps, 1),
+        "splits":           {"train": f"0:{1}"},
+        "data_path":   "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+        "video_path":  "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
+        "features": {
+            "observation.state": {
+                "dtype": "float64",
+                "shape": [state_dim],
+                "names": None,
+            },
+            "action": {
+                "dtype": "float64",
+                "shape": [action_dim],
+                "names": None,
+            },
+            "observation.images.wrist": {
+                "dtype": "video",
+                "shape": [3, h, w],
+                "info": {
+                    "video.height":       h,
+                    "video.width":        w,
+                    "video.codec":        "mp4v",
+                    "video.pix_fmt":      "rgb24",
+                    "video.is_depth_map": False,
+                    "video.fps":          round(fps, 1),
+                    "video.channels":     3,
+                    "has_audio":          False,
+                },
+            },
+            "timestamp":     {"dtype": "float32", "shape": [1], "names": None},
+            "frame_index":   {"dtype": "int64",   "shape": [1], "names": None},
+            "episode_index": {"dtype": "int64",   "shape": [1], "names": None},
+            "index":         {"dtype": "int64",   "shape": [1], "names": None},
+            "task_index":    {"dtype": "int64",   "shape": [1], "names": None},
+        },
+    }
+    with open(os.path.join(meta_dir, "info.json"), "w") as f:
+        json.dump(info, f, indent=2)
 
-    if rows:
-        print(f"\nSample row (first frame):")
-        print(f"  timestamp_ns:    {rows[0]['timestamp_ns']}")
-        print(f"  joint_positions: "
-              f"{[f'{v:.4f}' for v in rows[0]['joint_positions']]}")
-        print(f"  joint_commands:  "
-              f"{[f'{v:.4f}' for v in rows[0]['joint_commands']]}")
-        print(f"  state_gap_ms:    {rows[0]['state_gap_ms']:.3f}")
-        print(f"  cmd_gap_ms:      {rows[0]['cmd_gap_ms']:.3f}")
+    # meta/episodes.json
+    episodes = [{"episode_index": episode_id, "tasks": [task],
+                 "length": len(rows)}]
+    with open(os.path.join(meta_dir, "episodes.json"), "w") as f:
+        json.dump(episodes, f, indent=2)
+
+    # meta/tasks.json
+    tasks = [{"task_index": 0, "task": task}]
+    with open(os.path.join(meta_dir, "tasks.json"), "w") as f:
+        json.dump(tasks, f, indent=2)
+
+    print(f"\nExported (lerobot v2.1 format):")
+    print(f"  Embodiment: {embodiment}")
+    print(f"  Parquet:    {parquet_path}")
+    print(f"  Video:      {video_path}")
+    print(f"  Meta:       {meta_dir}/")
+    print(f"  Rows:       {len(rows)}")
+    print(f"\nSample row:")
+    print(f"  observation.state: {[f'{v:.4f}' for v in rows[0]['observation.state']]}")
+    print(f"  action:            {[f'{v:.4f}' for v in rows[0]['action']]}")
+    print(f"  timestamp:         {rows[0]['timestamp']:.4f}s")
+    print(f"  state_gap_ms:      {rows[0]['state_gap_ms']:.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Export MCAP episode to parquet + video. "
-                    "Embodiment auto-detected from topics."
+        description="Export MCAP episode to lerobot v2.1 format. "
+                    "Embodiment auto-detected from bag topics."
     )
-    parser.add_argument("bag_path",      help="Path to episode bag folder")
-    parser.add_argument("--output-dir",  default="datasets/processed")
-    parser.add_argument("--episode-id",  type=int, default=1)
+    parser.add_argument("bag_path",     help="Path to episode bag folder")
+    parser.add_argument("--output-dir", default="datasets/processed")
+    parser.add_argument("--episode-id", type=int, default=0)
+    parser.add_argument("--task",       default="reach and manipulate")
     args = parser.parse_args()
 
-    export_episode(args.bag_path, args.output_dir, args.episode_id)
+    export_episode(args.bag_path, args.output_dir,
+                   args.episode_id, args.task)
