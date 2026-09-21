@@ -10,9 +10,9 @@ from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import JointState, Image
 from geometry_msgs.msg import PoseStamped
-from cv_bridge import CvBridge
+#from cv_bridge import CvBridge
 
-bridge = CvBridge()
+#bridge = CvBridge()
 CHUNKS_SIZE = 1000
 CODEBASE_VERSION = "v2.1"
 
@@ -117,7 +117,15 @@ def export_episode(bag_path, output_dir, episode_id, task="reach and manipulate"
         os.makedirs(d, exist_ok=True)
 
     # video writer
-    first_rgb = bridge.imgmsg_to_cv2(images[0][1], desired_encoding="rgb8")
+    #first_rgb = bridge.imgmsg_to_cv2(images[0][1], desired_encoding="rgb8")
+
+    first_msg = images[0][1]
+    first_rgb = np.frombuffer(first_msg.data, dtype=np.uint8).reshape(
+        first_msg.height, first_msg.width, -1
+    )
+    if first_msg.encoding == 'bgr8':
+        first_rgb = first_rgb[:, :, ::-1]
+
     h, w = first_rgb.shape[:2]
     video_path = os.path.join(video_dir, f"{ep_str}.mp4")
     duration_s = (images[-1][0] - images[0][0]) / 1e9
@@ -144,8 +152,14 @@ def export_episode(bag_path, output_dir, episode_id, task="reach and manipulate"
         obs_state, _ = extract_state(state_msg, embodiment)
         action        = extract_command(cmd_msg)
 
-        rgb = bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
-        writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        rgb = np.frombuffer(img_msg.data, dtype=np.uint8).reshape(
+            img_msg.height, img_msg.width, -1
+        )
+        if img_msg.encoding == 'bgr8':
+            bgr = rgb
+        else:
+            bgr = rgb[:, :, ::-1]
+        writer.write(bgr)
 
         rows.append({
             # lerobot v2.1 required columns
@@ -239,16 +253,64 @@ def export_episode(bag_path, output_dir, episode_id, task="reach and manipulate"
     with open(os.path.join(meta_dir, "info.json"), "w") as f:
         json.dump(info, f, indent=2)
 
-    # meta/episodes.json
-    episodes = [{"episode_index": episode_id, "tasks": [task],
-                 "length": len(rows)}]
-    with open(os.path.join(meta_dir, "episodes.json"), "w") as f:
-        json.dump(episodes, f, indent=2)
+    # meta/episodes.jsonl — one JSON object per line (jsonlines format)
+    with open(os.path.join(meta_dir, "episodes.jsonl"), "w") as f:
+        f.write(json.dumps({"episode_index": episode_id,
+                            "tasks": [task],
+                            "length": len(rows)}) + "\n")
 
-    # meta/tasks.json
-    tasks = [{"task_index": 0, "task": task}]
-    with open(os.path.join(meta_dir, "tasks.json"), "w") as f:
-        json.dump(tasks, f, indent=2)
+    # meta/episodes_stats.jsonl — per-episode statistics for normalization
+    import statistics
+
+    positions_flat = [rows[i]["observation.state"] for i in range(len(rows))]
+    actions_flat   = [rows[i]["action"] for i in range(len(rows))]
+
+    def col_stats(matrix, dim):
+        col = [matrix[r][dim] for r in range(len(matrix))]
+        mean = sum(col) / len(col)
+        variance = sum((x - mean) ** 2 for x in col) / len(col)
+        std = variance ** 0.5
+        return mean, std, min(col), max(col)
+
+    state_dim  = len(rows[0]["observation.state"])
+    action_dim = len(rows[0]["action"])
+
+    state_stats  = [col_stats(positions_flat, d) for d in range(state_dim)]
+    action_stats = [col_stats(actions_flat,   d) for d in range(action_dim)]
+
+    ep_stats = {
+        "episode_index": episode_id,
+        "stats": {
+            "observation.state": {
+                "mean":  [state_stats[d][0] for d in range(state_dim)],
+                "std":   [state_stats[d][1] for d in range(state_dim)],
+                "min":   [state_stats[d][2] for d in range(state_dim)],
+                "max":   [state_stats[d][3] for d in range(state_dim)],
+                "count": [len(rows)],
+            },
+            "action": {
+                "mean":  [action_stats[d][0] for d in range(action_dim)],
+                "std":   [action_stats[d][1] for d in range(action_dim)],
+                "min":   [action_stats[d][2] for d in range(action_dim)],
+                "max":   [action_stats[d][3] for d in range(action_dim)],
+                "count": [len(rows)],
+            },
+            "timestamp": {
+                "mean":  [sum(r["timestamp"] for r in rows) / len(rows)],
+                "std":   [0.0],
+                "min":   [rows[0]["timestamp"]],
+                "max":   [rows[-1]["timestamp"]],
+                "count": [len(rows)],
+            },
+        }
+    }
+
+    with open(os.path.join(meta_dir, "episodes_stats.jsonl"), "w") as f:
+        f.write(json.dumps(ep_stats) + "\n")
+
+    # meta/tasks.jsonl — one JSON object per line
+    with open(os.path.join(meta_dir, "tasks.jsonl"), "w") as f:
+        f.write(json.dumps({"task_index": 0, "task": task}) + "\n")
 
     print(f"\nExported (lerobot v2.1 format):")
     print(f"  Embodiment: {embodiment}")
